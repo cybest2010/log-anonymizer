@@ -1,108 +1,63 @@
 """
-PII anonymization using Microsoft Presidio with custom Chinese recognizers.
+Three-layer PII anonymization engine.
 
-Supported entities:
-  PERSON, PHONE_NUMBER, EMAIL_ADDRESS, IP_ADDRESS, CREDIT_CARD,
-  CHINESE_ID_NUMBER (custom), CHINESE_PHONE (custom)
+  Layer 1 — Regex pre-filter   : phone, email, IP, credit card, Chinese ID
+                                  High confidence, zero NLP cost.
+  Layer 2 — NER model          : person names  (HanLP > spaCy fallback)
+  Layer 3 — Custom entities    : user-defined regex patterns
+
+Anonymization modes (per entity):
+  replace      — fixed label,   e.g.  <手机>
+  mask         — partial hide,  e.g.  138****5678
+  pseudonymize — HMAC token,    e.g.  [TEL_a3f2b1c0]  (consistent, key-bound)
+  redact       — full hide,     e.g.  [REDACTED]
 """
 
 import re
+import hmac
+import hashlib
 import logging
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Optional
-
-from presidio_analyzer import (
-    AnalyzerEngine,
-    RecognizerRegistry,
-    PatternRecognizer,
-    Pattern,
-)
-from presidio_analyzer.nlp_engine import NlpEngineProvider
-from presidio_anonymizer import AnonymizerEngine
-from presidio_anonymizer.entities import OperatorConfig
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Custom Chinese recognizers
-# ---------------------------------------------------------------------------
 
-def _make_chinese_id_recognizer() -> PatternRecognizer:
-    """18-digit Chinese resident ID number (末位可为 X)."""
-    pattern = Pattern(
-        name="chinese_id",
-        regex=r"\b\d{17}[\dXx]\b",
-        score=0.85,
-    )
-    return PatternRecognizer(
-        supported_entity="CHINESE_ID_NUMBER",
-        patterns=[pattern],
-        supported_language="zh",
-        context=["身份证", "证件", "ID", "证号"],
-    )
+# ── Modes ─────────────────────────────────────────────────────────────────────
+
+class AnonymizationMode(str, Enum):
+    REPLACE      = "replace"
+    MASK         = "mask"
+    PSEUDONYMIZE = "pseudo"
+    REDACT       = "redact"
 
 
-def _make_chinese_phone_recognizer() -> PatternRecognizer:
-    """Chinese mobile numbers: 1[3-9]XXXXXXXXX, optionally prefixed with +86 or 86."""
-    pattern = Pattern(
-        name="chinese_phone",
-        regex=r"(?<!\d)(?:\+?86[-\s]?)?1[3-9]\d{9}(?!\d)",
-        score=0.85,
-    )
-    return PatternRecognizer(
-        supported_entity="PHONE_NUMBER",
-        patterns=[pattern],
-        supported_language="zh",
-        context=["电话", "手机", "联系", "phone", "mobile", "tel"],
-    )
-
-
-# ---------------------------------------------------------------------------
-# Operator builders
-# ---------------------------------------------------------------------------
-
-_OPERATOR_PRESETS: dict[str, dict] = {
-    "PERSON": {"type": "replace", "new_value": "<姓名>"},
-    "PHONE_NUMBER": {"type": "mask", "masking_char": "*", "chars_to_mask": 4, "from_end": False},
-    "EMAIL_ADDRESS": {"type": "replace", "new_value": "<邮箱>"},
-    "IP_ADDRESS": {"type": "replace", "new_value": "<IP地址>"},
-    "CREDIT_CARD": {"type": "mask", "masking_char": "*", "chars_to_mask": 12, "from_end": False},
-    "CHINESE_ID_NUMBER": {"type": "mask", "masking_char": "*", "chars_to_mask": 10, "from_end": False},
-}
-
-
-def _build_operators(entities: list[str]) -> dict[str, OperatorConfig]:
-    ops: dict[str, OperatorConfig] = {}
-    for entity in entities:
-        preset = _OPERATOR_PRESETS.get(entity)
-        if preset:
-            cfg = dict(preset)
-            op_type = cfg.pop("type")
-            ops[entity] = OperatorConfig(op_type, cfg)
-    return ops
-
-
-# ---------------------------------------------------------------------------
-# Stats
-# ---------------------------------------------------------------------------
+# ── Per-entity config ─────────────────────────────────────────────────────────
 
 @dataclass
-class AnonymizationStats:
-    total_lines: int = 0
-    redacted_lines: int = 0
-    entity_counts: dict[str, int] = field(default_factory=dict)
+class EntityConfig:
+    enabled:      bool               = True
+    mode:         AnonymizationMode  = AnonymizationMode.REPLACE
+    # replace / redact
+    label:        str                = ""   # auto-set from defaults if empty
+    # mask
+    mask_char:    str                = "*"
+    keep_head:    int                = 3    # show first N chars
+    keep_tail:    int                = 4    # show last N chars
+    # pseudonymize
+    token_prefix: str                = ""   # auto-set from defaults if empty
 
-    def record(self, entities: list[str]) -> None:
-        self.total_lines += 1
-        if entities:
-            self.redacted_lines += 1
-            for e in entities:
-                self.entity_counts[e] = self.entity_counts.get(e, 0) + 1
+
+@dataclass
+class CustomEntityConfig:
+    """User-defined regex-based entity rule."""
+    name:    str                              # display name, e.g. "员工工号"
+    pattern: str                              # regex, e.g. r"EMP\d{6}"
+    config:  EntityConfig = field(default_factory=EntityConfig)
 
 
-# ---------------------------------------------------------------------------
-# Main anonymizer
-# ---------------------------------------------------------------------------
+# ── Built-in defaults ─────────────────────────────────────────────────────────
 
 ALL_ENTITIES = [
     "PERSON",
@@ -113,80 +68,267 @@ ALL_ENTITIES = [
     "CHINESE_ID_NUMBER",
 ]
 
+_DEFAULT_LABELS: dict[str, str] = {
+    "PERSON":           "<姓名>",
+    "PHONE_NUMBER":     "<手机>",
+    "EMAIL_ADDRESS":    "<邮箱>",
+    "IP_ADDRESS":       "<IP>",
+    "CREDIT_CARD":      "<卡号>",
+    "CHINESE_ID_NUMBER":"<证件>",
+}
+
+_DEFAULT_PREFIXES: dict[str, str] = {
+    "PERSON":           "USR",
+    "PHONE_NUMBER":     "TEL",
+    "EMAIL_ADDRESS":    "MAIL",
+    "IP_ADDRESS":       "IP",
+    "CREDIT_CARD":      "CARD",
+    "CHINESE_ID_NUMBER":"ID",
+}
+
+# (keep_head, keep_tail) defaults for mask mode
+_DEFAULT_MASK: dict[str, tuple[int, int]] = {
+    "PERSON":           (0, 0),
+    "PHONE_NUMBER":     (3, 4),   # 138****5678
+    "EMAIL_ADDRESS":    (1, 0),   # a*****@***
+    "IP_ADDRESS":       (0, 0),
+    "CREDIT_CARD":      (0, 4),   # ************1234
+    "CHINESE_ID_NUMBER":(6, 4),   # 110101********14
+}
+
+
+def default_entity_configs() -> dict[str, EntityConfig]:
+    out: dict[str, EntityConfig] = {}
+    for e in ALL_ENTITIES:
+        head, tail = _DEFAULT_MASK.get(e, (0, 0))
+        out[e] = EntityConfig(
+            label        = _DEFAULT_LABELS.get(e, f"<{e}>"),
+            token_prefix = _DEFAULT_PREFIXES.get(e, "PII"),
+            keep_head    = head,
+            keep_tail    = tail,
+        )
+    return out
+
+
+# ── Global anonymization config ───────────────────────────────────────────────
+
+@dataclass
+class AnonymizationConfig:
+    secret_key:      str                        = "change-me-in-production"
+    entities:        dict[str, EntityConfig]    = field(default_factory=default_entity_configs)
+    custom_entities: list[CustomEntityConfig]   = field(default_factory=list)
+
+
+# ── Layer 1: Regex pre-filter ─────────────────────────────────────────────────
+
+_REGEX_PATTERNS: dict[str, re.Pattern] = {
+    "PHONE_NUMBER": re.compile(
+        r"(?<!\d)(?:\+?86[-\s]?)?1[3-9]\d{9}(?!\d)"
+    ),
+    "EMAIL_ADDRESS": re.compile(
+        r"[\w.+\-]+@[\w\-]+\.[a-zA-Z]{2,}"
+    ),
+    "IP_ADDRESS": re.compile(
+        r"\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b"
+    ),
+    "CREDIT_CARD": re.compile(
+        r"\b(?:\d[ \-]?){15,16}\b"
+    ),
+    "CHINESE_ID_NUMBER": re.compile(
+        r"\b\d{17}[\dXx]\b"
+    ),
+}
+
+# Entities NOT handled by regex (handled by NER)
+_NER_ENTITIES = {"PERSON"}
+
+
+# ── Layer 2: NER — HanLP (primary) → spaCy (fallback) ────────────────────────
+
+_ner_backend: Optional[str] = None   # "hanlp" | "spacy" | "none"
+_hanlp_model = None
+_spacy_model = None
+
+
+def _init_ner() -> str:
+    global _ner_backend, _hanlp_model, _spacy_model
+    if _ner_backend is not None:
+        return _ner_backend
+
+    try:
+        import hanlp
+        _hanlp_model = hanlp.load(
+            hanlp.pretrained.mtl.CLOSE_TOK_POS_NER_SRL_DEP_SDP_CON_ELECTRA_SMALL_ZH,
+            tasks="ner/msra",
+        )
+        _ner_backend = "hanlp"
+        logger.info("NER backend: HanLP (ELECTRA-small)")
+        return _ner_backend
+    except Exception as exc:
+        logger.warning("HanLP unavailable (%s), trying spaCy ...", exc)
+
+    try:
+        import spacy
+        _spacy_model = spacy.load("zh_core_web_sm")
+        _ner_backend = "spacy"
+        logger.info("NER backend: spaCy zh_core_web_sm")
+        return _ner_backend
+    except Exception as exc:
+        logger.warning("spaCy unavailable (%s) — PERSON detection disabled.", exc)
+
+    _ner_backend = "none"
+    return _ner_backend
+
+
+def _ner_persons(text: str) -> list[str]:
+    """Return distinct person-name strings found in *text*."""
+    backend = _init_ner()
+
+    if backend == "hanlp" and _hanlp_model is not None:
+        try:
+            doc = _hanlp_model(text)
+            return list({
+                mention
+                for sent_ner in doc.get("ner/msra", [])
+                for mention, etype, *_ in sent_ner
+                if etype == "PERSON"
+            })
+        except Exception as exc:
+            logger.warning("HanLP NER error: %s", exc)
+            return []
+
+    if backend == "spacy" and _spacy_model is not None:
+        try:
+            return list({ent.text for ent in _spacy_model(text).ents if ent.label_ == "PERSON"})
+        except Exception as exc:
+            logger.warning("spaCy NER error: %s", exc)
+            return []
+
+    return []
+
+
+# ── Anonymization helpers ─────────────────────────────────────────────────────
+
+def _apply(value: str, entity: str, cfg: EntityConfig, secret: bytes) -> str:
+    mode = cfg.mode
+
+    if mode == AnonymizationMode.REDACT:
+        return "[REDACTED]"
+
+    if mode == AnonymizationMode.REPLACE:
+        return cfg.label or _DEFAULT_LABELS.get(entity, f"<{entity}>")
+
+    if mode == AnonymizationMode.MASK:
+        n = len(value)
+        head = min(cfg.keep_head, n)
+        tail = min(cfg.keep_tail, n - head)
+        hidden = max(0, n - head - tail)
+        return value[:head] + cfg.mask_char * hidden + (value[-tail:] if tail else "")
+
+    if mode == AnonymizationMode.PSEUDONYMIZE:
+        token  = hmac.new(secret, value.encode("utf-8"), hashlib.sha256).hexdigest()[:8]
+        prefix = cfg.token_prefix or _DEFAULT_PREFIXES.get(entity, "PII")
+        return f"[{prefix}_{token}]"
+
+    return value  # fallback
+
+
+# ── Stats ─────────────────────────────────────────────────────────────────────
+
+@dataclass
+class AnonymizationStats:
+    total_lines:   int             = 0
+    redacted_lines: int            = 0
+    entity_counts: dict[str, int]  = field(default_factory=dict)
+
+    def record(self, entities: list[str]) -> None:
+        self.total_lines += 1
+        if entities:
+            self.redacted_lines += 1
+            for e in entities:
+                self.entity_counts[e] = self.entity_counts.get(e, 0) + 1
+
+
+# ── Main anonymizer ───────────────────────────────────────────────────────────
 
 class LogAnonymizer:
-    def __init__(self, entities: Optional[list[str]] = None, language: str = "zh"):
-        self.language = language
-        self.entities = entities or ALL_ENTITIES
+    def __init__(self, config: Optional[AnonymizationConfig] = None):
+        self.config = config or AnonymizationConfig()
+        self._secret = self.config.secret_key.encode("utf-8")
+        self.stats   = AnonymizationStats()
 
-        # NLP engine (spaCy zh_core_web_sm)
-        conf = {
-            "nlp_engine_name": "spacy",
-            "models": [{"lang_code": "zh", "model_name": "zh_core_web_sm"}],
-        }
-        provider = NlpEngineProvider(nlp_configuration=conf)
-        nlp_engine = provider.create_engine()
+        # Compile custom patterns once
+        self._custom: list[tuple[str, re.Pattern, EntityConfig]] = []
+        for ce in self.config.custom_entities:
+            try:
+                self._custom.append((ce.name, re.compile(ce.pattern), ce.config))
+            except re.error as exc:
+                logger.warning("Invalid custom pattern %r: %s", ce.pattern, exc)
 
-        # Registry with custom recognizers
-        registry = RecognizerRegistry()
-        registry.load_predefined_recognizers(languages=[language], nlp_engine=nlp_engine)
-        registry.add_recognizer(_make_chinese_id_recognizer())
-        registry.add_recognizer(_make_chinese_phone_recognizer())
+        # Pre-warm NER if PERSON is enabled
+        if self._enabled("PERSON"):
+            _init_ner()
 
-        self.analyzer = AnalyzerEngine(
-            nlp_engine=nlp_engine,
-            registry=registry,
-            supported_languages=[language],
-        )
-        self.engine = AnonymizerEngine()
-        self.operators = _build_operators(self.entities)
-        self.stats = AnonymizationStats()
+    # ── helpers ──────────────────────────────────────────────────────────────
+
+    def _enabled(self, entity: str) -> bool:
+        cfg = self.config.entities.get(entity)
+        return cfg is not None and cfg.enabled
+
+    def _cfg(self, entity: str) -> EntityConfig:
+        return self.config.entities.get(entity, EntityConfig())
+
+    # ── main entry point ─────────────────────────────────────────────────────
 
     def anonymize(self, text: str) -> tuple[str, list[str]]:
-        """
-        Anonymize text. Returns (anonymized_text, list_of_detected_entity_types).
-        """
+        """Return (anonymized_text, detected_entity_types)."""
         if not text:
             return text, []
 
-        try:
-            results = self.analyzer.analyze(
-                text=text,
-                language=self.language,
-                entities=[e for e in self.entities if e != "CHINESE_ID_NUMBER"],
-            )
-        except Exception as exc:
-            logger.warning("Analyzer error for text %r: %s", text[:50], exc)
-            results = []
+        detected: list[str] = []
 
-        # Chinese ID numbers are regex-only — run separately to avoid spaCy issues
-        if "CHINESE_ID_NUMBER" in self.entities:
-            try:
-                id_results = self.analyzer.analyze(
-                    text=text,
-                    language=self.language,
-                    entities=["CHINESE_ID_NUMBER"],
-                )
-                results = results + id_results
-            except Exception as exc:
-                logger.warning("Chinese ID analysis error: %s", exc)
+        # ── Layer 1: regex ────────────────────────────────────────────────────
+        for entity, pattern in _REGEX_PATTERNS.items():
+            if not self._enabled(entity):
+                continue
+            cfg = self._cfg(entity)
 
-        detected = list({r.entity_type for r in results})
-        self.stats.record(detected)
+            def _repl(m: re.Match, e=entity, c=cfg) -> str:
+                return _apply(m.group(), e, c, self._secret)
 
-        if not results:
-            return text, []
+            new_text, n = pattern.subn(_repl, text)
+            if n:
+                text = new_text
+                detected.append(entity)
 
-        try:
-            anonymized = self.engine.anonymize(
-                text=text,
-                analyzer_results=results,
-                operators=self.operators,
-            )
-            return anonymized.text, detected
-        except Exception as exc:
-            logger.warning("Anonymizer error: %s", exc)
-            return text, []
+        # ── Layer 2: NER (PERSON) ─────────────────────────────────────────────
+        if self._enabled("PERSON"):
+            cfg = self._cfg("PERSON")
+            persons = _ner_persons(text)
+            for name in persons:
+                replacement = _apply(name, "PERSON", cfg, self._secret)
+                text = text.replace(name, replacement)
+            if persons:
+                detected.append("PERSON")
+
+        # ── Layer 3: custom entities ──────────────────────────────────────────
+        for name, pattern, cfg in self._custom:
+            if not cfg.enabled:
+                continue
+
+            def _repl_custom(m: re.Match, n=name, c=cfg) -> str:
+                return _apply(m.group(), n, c, self._secret)
+
+            new_text, count = pattern.subn(_repl_custom, text)
+            if count:
+                text = new_text
+                detected.append(name)
+
+        # deduplicate while preserving first-occurrence order
+        seen: set[str] = set()
+        unique = [e for e in detected if not (e in seen or seen.add(e))]  # type: ignore[func-returns-value]
+        self.stats.record(unique)
+        return text, unique
 
     def reset_stats(self) -> None:
         self.stats = AnonymizationStats()
