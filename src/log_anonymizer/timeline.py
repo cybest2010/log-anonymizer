@@ -165,7 +165,7 @@ def build_timeline(df: pd.DataFrame, config: TimelineConfig) -> Optional[go.Figu
     df = df.copy()
 
     # ── Parse timestamps ──────────────────────────────────────────────────────
-    df["_dt"] = pd.to_datetime(df["time"], errors="coerce", infer_datetime_format=True)
+    df["_dt"] = pd.to_datetime(df["time"], errors="coerce")
     df = df.dropna(subset=["_dt"]).sort_values("_dt").reset_index(drop=True)
     if df.empty:
         return None
