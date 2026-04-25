@@ -112,6 +112,11 @@ class TimelineConfig:
     max_points:              int             = 3000
     custom_event_types:      list[EventType] = field(default_factory=list)
     lane_rules:              list[LaneRule]  = field(default_factory=list)
+    # Lane grouping when a "source" column is present:
+    #   "service"        — group by service (default, single-file behaviour)
+    #   "source"         — one lane per source file
+    #   "source_service" — one lane per (source › service) pair
+    lane_mode:               str             = "service"
 
 
 # ── Anomaly window detection ──────────────────────────────────────────────────
@@ -183,12 +188,23 @@ def build_timeline(df: pd.DataFrame, config: TimelineConfig) -> Optional[go.Figu
         except re.error:
             pass
 
+    has_source = "source" in df.columns
+
     def _lane(row: pd.Series) -> str:
         msg = str(row.get("msg", ""))
         for pattern, name in compiled_rules:
             if pattern.search(msg):
+                # apply lane_mode prefix if multi-source
+                if has_source and config.lane_mode in ("source", "source_service"):
+                    return f"{row.get('source', '')} › {name}"
                 return name
-        return str(row.get("service", "unknown"))
+        service = str(row.get("service", "unknown"))
+        if not has_source or config.lane_mode == "service":
+            return service
+        source = str(row.get("source", ""))
+        if config.lane_mode == "source":
+            return source
+        return f"{source} › {service}"  # source_service
 
     df["_lane"] = df.apply(_lane, axis=1)
 
