@@ -27,10 +27,12 @@ from src.log_anonymizer.correlation import (
     CorrelationConfig,
     build_cascade_heatmap,
     build_id_timeline,
+    build_service_sankey,
     compute_rate_correlation,
     detect_error_cascades,
     extract_common_ids,
 )
+from src.log_anonymizer.latency import build_latency_charts
 
 # ── Page config ───────────────────────────────────────────────────────────────
 
@@ -43,12 +45,13 @@ st.set_page_config(
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 ENTITY_LABELS: dict[str, str] = {
-    "PERSON":            "姓名",
-    "PHONE_NUMBER":      "手机号",
-    "EMAIL_ADDRESS":     "邮箱",
-    "IP_ADDRESS":        "IP 地址",
-    "CREDIT_CARD":       "银行卡号",
-    "CHINESE_ID_NUMBER": "身份证号",
+    "PERSON":                    "姓名",
+    "PHONE_NUMBER":              "手机号",
+    "EMAIL_ADDRESS":             "邮箱",
+    "IP_ADDRESS":                "IP 地址",
+    "CREDIT_CARD":               "银行卡号",
+    "CHINESE_ID_NUMBER":         "身份证号",
+    "UNIFIED_SOCIAL_CREDIT_CODE":"统一社会信用代码",
 }
 
 MODE_OPTIONS: dict[str, AnonymizationMode] = {
@@ -228,10 +231,18 @@ merged_df = (
 
 total_parsed   = sum(s.total_lines   for s in per_file_stats.values())
 total_redacted = sum(s.redacted_lines for s in per_file_stats.values())
+total_fallback = int((merged_df["parse_method"] == "fallback").sum())
+fallback_pct   = round(total_fallback / total_parsed * 100, 1) if total_parsed else 0
+
 st.success(
     f"全部处理完成！{len(uploaded_files)} 个文件，共 **{total_parsed}** 条，"
     f"其中 **{total_redacted}** 条含脱敏内容。"
 )
+if total_fallback:
+    st.warning(
+        f"**{total_fallback}** 条（{fallback_pct}%）未能匹配任何 Grok 模式，"
+        f"已作为纯文本保留。如比例过高，可在「通道拆分规则」中添加自定义 Grok 模式。"
+    )
 
 if len(uploaded_files) > 1:
     with st.expander("各文件详情", expanded=False):
@@ -252,12 +263,16 @@ if len(uploaded_files) > 1:
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 
-tabs = st.tabs(["📋 数据预览 & 导出", "📈 时序图分析", "🔗 关联分析"])
+tabs = st.tabs(["📋 数据预览 & 导出", "📈 时序图分析", "⏱️ 耗时分析", "🔗 关联分析"])
 
 # ── Tab 1: Data preview ───────────────────────────────────────────────────────
 
 with tabs[0]:
-    # Source filter when multiple files
+    # ── Filters ───────────────────────────────────────────────────────────────
+    fc1, fc2 = st.columns([3, 1])
+    search_kw = fc1.text_input("关键词搜索（消息内容）", placeholder="输入关键词过滤…", label_visibility="collapsed")
+    highlight  = fc2.toggle("高亮脱敏行", value=True)
+
     if len(uploaded_files) > 1:
         all_sources = ["全部"] + list(per_file_dfs.keys())
         selected_source = st.selectbox("来源过滤", all_sources, key="src_filter")
@@ -265,14 +280,40 @@ with tabs[0]:
     else:
         view_df = merged_df
 
-    highlight = st.toggle("高亮含脱敏内容的行", value=True)
+    if search_kw.strip():
+        mask = view_df["msg"].str.contains(search_kw.strip(), case=False, na=False)
+        view_df = view_df[mask]
+        st.caption(f"搜索到 {len(view_df)} 条匹配记录")
 
     def _hl(row: pd.Series):
         if highlight and row.get("redacted_entities"):
             return ["background-color: #fff3cd"] * len(row)
         return [""] * len(row)
 
-    st.dataframe(view_df.style.apply(_hl, axis=1), use_container_width=True, height=440)
+    display_cols = ["time", "level", "service", "msg", "redacted_entities", "source"] \
+        if "source" in view_df.columns else ["time", "level", "service", "msg", "redacted_entities"]
+    st.dataframe(view_df[display_cols].style.apply(_hl, axis=1), use_container_width=True, height=440)
+
+    # ── Before / After comparison ─────────────────────────────────────────────
+    with st.expander("脱敏前后对比（点击行查看原始内容）"):
+        redacted_rows = view_df[view_df["redacted_entities"] != ""].reset_index(drop=True)
+        if redacted_rows.empty:
+            st.info("当前视图中无含脱敏内容的行。")
+        else:
+            row_options = [
+                f"[{i}] {r['time']}  {r['service'][:40]}  ({r['redacted_entities']})"
+                for i, r in redacted_rows.iterrows()
+            ]
+            selected_idx = st.selectbox("选择一条记录", range(len(row_options)),
+                                        format_func=lambda i: row_options[i],
+                                        label_visibility="collapsed")
+            sel = redacted_rows.iloc[selected_idx]
+            col_orig, col_anon = st.columns(2)
+            col_orig.markdown("**原始消息**")
+            col_orig.code(sel["original_msg"], language="text")
+            col_anon.markdown("**脱敏后消息**")
+            col_anon.code(sel["msg"], language="text")
+            st.caption(f"检测到实体：{sel['redacted_entities']}")
 
     c1, c2, c3 = st.columns(3)
     c1.download_button(
@@ -297,7 +338,7 @@ with tabs[0]:
 
 # ── Tab 2: Timeline ───────────────────────────────────────────────────────────
 
-with tabs[1]:
+with tabs[1]:  # noqa: E501 (keep original timeline code unchanged below)
     st.markdown("#### 时序图配置")
     tc1, tc2, tc3 = st.columns(3)
     bucket_min  = tc1.slider("密度图时间桶 (分钟)",    1, 30, 5)
@@ -390,9 +431,28 @@ with tabs[1]:
                     unsafe_allow_html=True,
                 )
 
-# ── Tab 3: Correlation analysis ───────────────────────────────────────────────
+# ── Tab 3: Latency analysis ───────────────────────────────────────────────────
 
 with tabs[2]:
+    with st.spinner("正在提取耗时数据..."):
+        lat_bar, lat_scatter, lat_summary = build_latency_charts(merged_df)
+
+    if lat_bar is None:
+        st.info(
+            "未在日志中检测到耗时数据。\n\n"
+            "支持的格式：`耗时：97ms`、`耗时时长为：59ms`、`took 120ms`、`duration=50ms`"
+        )
+    else:
+        st.plotly_chart(lat_bar, use_container_width=True)
+        if lat_scatter:
+            st.plotly_chart(lat_scatter, use_container_width=True)
+        st.subheader("耗时统计汇总")
+        st.dataframe(lat_summary, use_container_width=True, hide_index=True)
+
+
+# ── Tab 4: Correlation analysis ───────────────────────────────────────────────
+
+with tabs[3]:
     if len(per_file_dfs) < 2:
         st.info("上传 **2 个及以上**日志文件后，此处将自动进行跨文件关联分析。")
         st.stop()
@@ -466,3 +526,15 @@ with tabs[2]:
             "未在多个来源中发现相同标识符。\n\n"
             "可在上方「追踪 ID 正则」中添加业务 ID 格式（如 `ORD-\\d+`、`TRX\\d{10}`）。"
         )
+
+    st.divider()
+
+    # ── Section 4: Service Sankey ──────────────────────────────────────────────
+    st.subheader("④ 服务调用量 Sankey 图")
+    st.caption("展示日志来源 → 服务 → 日志级别的流量分布，节点宽度对应日志量。")
+    with st.spinner("正在生成 Sankey 图..."):
+        sankey_fig = build_service_sankey(per_file_dfs)
+    if sankey_fig:
+        st.plotly_chart(sankey_fig, use_container_width=True)
+    else:
+        st.info("数据不足，无法生成 Sankey 图。")

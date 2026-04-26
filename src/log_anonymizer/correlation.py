@@ -251,6 +251,115 @@ def extract_common_ids(
     )
 
 
+def build_service_sankey(
+    dfs: dict[str, pd.DataFrame],
+) -> Optional[go.Figure]:
+    """
+    Build a Sankey diagram showing: Source → Service → Log Level flow.
+    Node sizes are proportional to log volume.
+    Works for both single-file (Service → Level) and multi-file (Source → Service → Level).
+    """
+    # Abbreviate long Java class names
+    def _shorten(name: str) -> str:
+        parts = str(name).split(".")
+        return ".".join(parts[-2:]) if len(parts) >= 2 else name
+
+    multi = len(dfs) > 1
+
+    label_list: list[str] = []
+    label_index: dict[str, int] = {}
+    sources_idx: list[int] = []
+    targets_idx: list[int] = []
+    values: list[int] = []
+
+    def _node(name: str) -> int:
+        if name not in label_index:
+            label_index[name] = len(label_list)
+            label_list.append(name)
+        return label_index[name]
+
+    for src_label, df in dfs.items():
+        for _, row in df.iterrows():
+            svc   = _shorten(str(row.get("service", "unknown")))
+            level = str(row.get("level", "UNKNOWN")).upper()
+            if level not in ("INFO", "DEBUG", "WARN", "WARNING", "ERROR", "FATAL"):
+                level = "OTHER"
+
+            if multi:
+                # Source → Service → Level
+                s_node = _node(src_label)
+                v_node = _node(svc)
+                l_node = _node(level)
+                sources_idx += [s_node, v_node]
+                targets_idx += [v_node, l_node]
+                values      += [1, 1]
+            else:
+                # Service → Level
+                v_node = _node(svc)
+                l_node = _node(level)
+                sources_idx.append(v_node)
+                targets_idx.append(l_node)
+                values.append(1)
+
+    if not sources_idx:
+        return None
+
+    # Aggregate duplicate edges
+    edge_map: dict[tuple[int, int], int] = {}
+    for s, t, v in zip(sources_idx, targets_idx, values):
+        edge_map[(s, t)] = edge_map.get((s, t), 0) + v
+
+    agg_src, agg_tgt, agg_val = [], [], []
+    for (s, t), v in edge_map.items():
+        agg_src.append(s)
+        agg_tgt.append(t)
+        agg_val.append(v)
+
+    # Color nodes by type
+    level_colors = {"ERROR": "#F44336", "FATAL": "#B71C1C", "WARN": "#FF9800",
+                    "WARNING": "#FF9800", "INFO": "#4CAF50", "DEBUG": "#9E9E9E", "OTHER": "#BDBDBD"}
+    node_colors = []
+    for lbl in label_list:
+        up = lbl.upper()
+        if up in level_colors:
+            node_colors.append(level_colors[up])
+        elif multi and lbl in dfs:
+            node_colors.append("#1565C0")
+        else:
+            node_colors.append("#42A5F5")
+
+    title = "服务调用量分布 (来源 → 服务 → 日志级别)" if multi else "服务日志级别分布 (服务 → 级别)"
+    n_nodes = len(label_list)
+
+    fig = go.Figure(go.Sankey(
+        arrangement="snap",
+        node=dict(
+            pad=12,
+            thickness=18,
+            line=dict(color="#bbb", width=0.5),
+            label=label_list,
+            color=node_colors,
+            hovertemplate="<b>%{label}</b><br>总量: %{value}<extra></extra>",
+        ),
+        link=dict(
+            source=agg_src,
+            target=agg_tgt,
+            value=agg_val,
+            hovertemplate=(
+                "<b>%{source.label}</b> → <b>%{target.label}</b><br>"
+                "日志量: %{value}<extra></extra>"
+            ),
+        ),
+    ))
+    fig.update_layout(
+        title=title,
+        height=max(420, 30 * n_nodes + 180),
+        margin=dict(l=10, r=10, t=50, b=10),
+        font_size=12,
+    )
+    return fig
+
+
 def build_id_timeline(
     id_val: str,
     dfs: dict[str, pd.DataFrame],

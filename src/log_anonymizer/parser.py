@@ -33,7 +33,10 @@ def _get_compiled_patterns() -> list[Grok]:
 
 
 def parse_line(line: str) -> dict:
-    """Parse a single log line. Returns a dict with at least a 'msg' key."""
+    """Parse a single log line. Returns a dict with at least a 'msg' key.
+
+    The returned dict includes a '_parse_method' key: 'json' | 'grok' | 'fallback'.
+    """
     line = line.strip()
     if not line:
         return {}
@@ -42,7 +45,9 @@ def parse_line(line: str) -> dict:
     if line.startswith("{"):
         try:
             raw = json.loads(line)
-            return LogModel.model_validate(raw).model_dump()
+            result = LogModel.model_validate(raw).model_dump()
+            result["_parse_method"] = "json"
+            return result
         except (json.JSONDecodeError, ValueError) as exc:
             logger.debug("JSON parse failed: %s", exc)
 
@@ -55,10 +60,14 @@ def parse_line(line: str) -> dict:
             continue
         if match:
             raw = {k: v for k, v in match.items() if v is not None}
-            return LogModel.model_validate(raw).model_dump()
+            result = LogModel.model_validate(raw).model_dump()
+            result["_parse_method"] = "grok"
+            return result
 
     # Fallback: treat entire line as message
-    return LogModel.model_validate({"msg": line}).model_dump()
+    result = LogModel.model_validate({"msg": line}).model_dump()
+    result["_parse_method"] = "fallback"
+    return result
 
 
 def parse_lines(lines: list[str]) -> list[dict]:
