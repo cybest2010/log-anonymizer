@@ -80,22 +80,19 @@ def build_latency_charts(
         return None, None, None
 
     # ── Aggregation ───────────────────────────────────────────────────────────
-    def _agg(g: pd.Series) -> pd.Series:
-        return pd.Series({
-            "样本数":   len(g),
-            "P50 (ms)": round(float(np.percentile(g, 50)), 1),
-            "P95 (ms)": round(float(np.percentile(g, 95)), 1),
-            "P99 (ms)": round(float(np.percentile(g, 99)), 1),
-            "最大 (ms)": round(float(g.max()), 1),
-            "平均 (ms)": round(float(g.mean()), 1),
+    rows = []
+    for svc, grp in lat_df.groupby("service")["latency_ms"]:
+        vals = grp.values
+        rows.append({
+            "service":  svc,
+            "样本数":   len(vals),
+            "P50 (ms)": round(float(np.percentile(vals, 50)), 1),
+            "P95 (ms)": round(float(np.percentile(vals, 95)), 1),
+            "P99 (ms)": round(float(np.percentile(vals, 99)), 1),
+            "最大 (ms)": round(float(vals.max()), 1),
+            "平均 (ms)": round(float(vals.mean()), 1),
         })
-
-    summary = (
-        lat_df.groupby("service")["latency_ms"]
-        .apply(_agg)
-        .reset_index()
-        .sort_values("P95 (ms)", ascending=True)
-    )
+    summary = pd.DataFrame(rows).sort_values("P95 (ms)", ascending=True)
 
     # ── Bar chart ─────────────────────────────────────────────────────────────
     bar_fig = go.Figure()
